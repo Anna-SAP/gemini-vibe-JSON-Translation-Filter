@@ -1,0 +1,5 @@
+{
+  "name": "JSON Translation Filter",
+  "description": "An application to upload a JSON file with multilingual translations, filter its contents by source (en-US) and target languages, and copy the results.",
+  "requestFramePermissions": []
+}
