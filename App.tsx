@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ClipboardIcon from './components/icons/ClipboardIcon';
 import CheckIcon from './components/icons/CheckIcon';
 
@@ -9,33 +10,28 @@ const workerCode = `
   let currentFilteredTranslations = [];
   const PAGE_SIZE = 50;
 
-  const postPage = (page, type, jobId) => {
+  const generatePage = (page, data, view, selectedLanguages) => {
       const start = page * PAGE_SIZE;
       const end = start + PAGE_SIZE;
-      const pageData = currentFilteredTranslations.slice(start, end);
-      const hasMore = end < currentFilteredTranslations.length;
+      const pageData = data.slice(start, end);
+      const hasMore = end < data.length;
 
-      let pageString = '';
-      if (pageData.length > 0) {
-          pageString = pageData.map(item => JSON.stringify(item, null, 2)).join(',\\n');
+      let resultData = pageData;
+
+      if (view === 'subset' && Array.isArray(selectedLanguages)) {
+         resultData = pageData.map(item => {
+            const newItem = { key: item.key };
+            selectedLanguages.forEach(lang => {
+               if (item[lang] !== undefined) {
+                 newItem[lang] = item[lang];
+               }
+            });
+            return newItem;
+         });
       }
 
-      const message = {
-          type,
-          results: pageString,
-          hasMore,
-          page,
-          jobId,
-      };
-
-      if (type === 'loaded') {
-          message.total = allTranslations.length;
-          message.count = currentFilteredTranslations.length;
-      } else if (type === 'filtered') {
-          message.count = currentFilteredTranslations.length;
-      }
-      
-      self.postMessage(message);
+      const pageString = resultData.map(item => JSON.stringify(item, null, 2)).join(',\\n');
+      return { pageString, hasMore };
   };
 
   self.onmessage = (event) => {
@@ -48,12 +44,26 @@ const workerCode = `
           if (!Array.isArray(data)) {
             throw new Error("JSON is not an array.");
           }
-          if (data.length > 0 && (typeof data[0].key === 'undefined' || typeof data[0]['en-US'] === 'undefined')) {
-              throw new Error("JSON objects do not have the required 'key' and 'en-US' properties.");
+          if (data.length > 0 && (typeof data[0].key === 'undefined')) {
+              throw new Error("JSON objects must have a 'key' property.");
           }
+          
           allTranslations = data;
+          // Reset filtered to all initially
           currentFilteredTranslations = allTranslations;
-          postPage(0, 'loaded', jobId);
+          
+          // Extract languages from the first item
+          const languages = data.length > 0 
+            ? Object.keys(data[0]).filter(k => k !== 'key')
+            : [];
+
+          self.postMessage({ 
+            type: 'loaded', 
+            total: allTranslations.length, 
+            count: allTranslations.length, 
+            languages,
+            jobId 
+          });
           break;
 
         case 'filter':
@@ -88,17 +98,42 @@ const workerCode = `
                   });
               }
           }
-          postPage(0, 'filtered', jobId);
+          self.postMessage({ type: 'filtered', count: currentFilteredTranslations.length, jobId });
           break;
 
-        case 'get-next-page':
-          const { page } = payload;
-          postPage(page, 'page-data', jobId);
+        case 'get-page':
+          const { page, view, selectedLanguages } = payload;
+          // 'view' can be 'main' or 'subset'
+          const { pageString, hasMore } = generatePage(page, currentFilteredTranslations, view, selectedLanguages);
+          
+          self.postMessage({
+            type: 'page-data',
+            view,
+            results: pageString,
+            hasMore,
+            page,
+            jobId
+          });
           break;
         
-        case 'get-full-filtered-json':
-          const fullJson = JSON.stringify(currentFilteredTranslations, null, 2);
-          self.postMessage({ type: 'full-json-result', fullJson, jobId });
+        case 'get-full-json':
+          const { view: jsonView, selectedLanguages: jsonSelectedLangs } = payload;
+          let fullJsonData = currentFilteredTranslations;
+          
+          if (jsonView === 'subset' && Array.isArray(jsonSelectedLangs)) {
+             fullJsonData = currentFilteredTranslations.map(item => {
+                const newItem = { key: item.key };
+                jsonSelectedLangs.forEach(lang => {
+                   if (item[lang] !== undefined) {
+                     newItem[lang] = item[lang];
+                   }
+                });
+                return newItem;
+             });
+          }
+
+          const fullJson = JSON.stringify(fullJsonData, null, 2);
+          self.postMessage({ type: 'full-json-result', fullJson, view: jsonView, jobId });
           break;
       }
     } catch (err) {
@@ -108,26 +143,85 @@ const workerCode = `
   };
 `;
 
-
 const App: React.FC = () => {
   const [sourceSearch, setSourceSearch] = useState('');
   const [targetSearch, setTargetSearch] = useState('');
-  const [isCopied, setIsCopied] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // --- State for worker-based and paginated logic ---
+  // Language Filtering State
+  const [availableLanguages, setAvailableLanguages] = useState<string[]>([]);
+  const [selectedLanguages, setSelectedLanguages] = useState<Set<string>>(new Set());
+  
+  // Ref to track selected languages for stable access in callbacks (fixes stale closure bugs)
+  const selectedLanguagesRef = useRef<Set<string>>(new Set());
+
+  // App Status
   const [status, setStatus] = useState<Status>('idle');
   const [totalCount, setTotalCount] = useState(0);
   const [filteredCount, setFilteredCount] = useState(0);
-  const [resultsString, setResultsString] = useState('');
-  const [hasMore, setHasMore] = useState(false);
-  const [currentPage, setCurrentPage] = useState(0);
+
+  // Main Results State
+  const [mainResultsString, setMainResultsString] = useState('');
+  const [mainHasMore, setMainHasMore] = useState(false);
+  const [mainCurrentPage, setMainCurrentPage] = useState(0);
+  const [isMainCopied, setIsMainCopied] = useState(false);
+
+  // Filtered (Subset) Results State
+  const [subsetResultsString, setSubsetResultsString] = useState('');
+  const [subsetHasMore, setSubsetHasMore] = useState(false);
+  const [subsetCurrentPage, setSubsetCurrentPage] = useState(0);
+  const [isSubsetCopied, setIsSubsetCopied] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
-  const preRef = useRef<HTMLPreElement | null>(null);
-  const jobIdRef = useRef<number>(0); // Ref to track the current job ID
+  const mainPreRef = useRef<HTMLPreElement | null>(null);
+  const subsetPreRef = useRef<HTMLPreElement | null>(null);
+  const jobIdRef = useRef<number>(0);
+
+  // Update the ref whenever state changes
+  useEffect(() => {
+    selectedLanguagesRef.current = selectedLanguages;
+  }, [selectedLanguages]);
+
+  // Format language code to display name
+  const getDisplayName = useMemo(() => {
+    let langNames: Intl.DisplayNames | undefined;
+    try {
+      langNames = new Intl.DisplayNames(['en'], { type: 'language' });
+    } catch (e) {
+      // Fallback if not supported
+    }
+    
+    return (code: string) => {
+        if (!langNames) return code;
+        try {
+            const name = langNames.of(code);
+            return `${name} (${code})`;
+        } catch (e) {
+            return code;
+        }
+    };
+  }, []);
+
+  // Sort languages to put en-US first, then alphabetical
+  const sortedLanguages = useMemo(() => {
+    return [...availableLanguages].sort((a, b) => {
+      if (a === 'en-US') return -1;
+      if (b === 'en-US') return 1;
+      return a.localeCompare(b);
+    });
+  }, [availableLanguages]);
+
+  // Stable request page function using the Ref
+  const requestPage = useCallback((page: number, view: 'main' | 'subset', langsOverride?: string[]) => {
+      const langs = langsOverride || Array.from(selectedLanguagesRef.current);
+      workerRef.current?.postMessage({
+          type: 'get-page',
+          jobId: jobIdRef.current,
+          payload: { page, view, selectedLanguages: langs }
+      });
+  }, []);
 
   useEffect(() => {
     const blob = new Blob([workerCode], { type: 'application/javascript' });
@@ -135,43 +229,63 @@ const App: React.FC = () => {
     workerRef.current = new Worker(workerUrl);
 
     workerRef.current.onmessage = (event: MessageEvent<{ type: string; jobId?: number; [key: string]: any }>) => {
-      const { type, jobId, results, count, total, hasMore: newHasMore, page, message, fullJson } = event.data;
+      const { type, jobId, results, count, total, hasMore, page, message, fullJson, languages, view } = event.data;
 
-      // --- CRITICAL: Ignore messages from old jobs ---
-      if (jobId !== undefined && jobId !== jobIdRef.current) {
-        return;
-      }
+      if (jobId !== undefined && jobId !== jobIdRef.current) return;
 
       switch (type) {
         case 'loaded':
-        case 'filtered':
-          setResultsString(results);
+          setAvailableLanguages(languages || []);
+          setSelectedLanguages(new Set(languages || []));
+          
+          setTotalCount(total);
           setFilteredCount(count);
-          if (type === 'loaded') {
-            setTotalCount(total);
-          }
-          setHasMore(newHasMore);
-          setCurrentPage(page);
-          if (preRef.current) {
-            preRef.current.scrollTop = 0;
-          }
+          
+          // Initial request for data
+          requestPage(0, 'main');
+          // Explicitly pass languages here to ensure the first render is correct regardless of state update timing
+          requestPage(0, 'subset', languages || []);
+          setStatus('ready');
+          break;
+
+        case 'filtered':
+          setFilteredCount(count);
+          // Clear current displays
+          setMainResultsString('');
+          setSubsetResultsString('');
+          // Request first pages - this will now use the selectedLanguagesRef
+          requestPage(0, 'main');
+          requestPage(0, 'subset');
+          
+          if (mainPreRef.current) mainPreRef.current.scrollTop = 0;
+          if (subsetPreRef.current) subsetPreRef.current.scrollTop = 0;
+          
           setStatus('ready');
           break;
 
         case 'page-data':
-          if (results) {
-            setResultsString(prev => (prev ? `${prev},\n${results}` : results));
+          if (view === 'main') {
+             setMainResultsString(prev => (page === 0 ? results : (prev ? `${prev},\n${results}` : results)));
+             setMainHasMore(hasMore);
+             setMainCurrentPage(page);
+          } else if (view === 'subset') {
+             setSubsetResultsString(prev => (page === 0 ? results : (prev ? `${prev},\n${results}` : results)));
+             setSubsetHasMore(hasMore);
+             setSubsetCurrentPage(page);
           }
-          setHasMore(newHasMore);
-          setCurrentPage(page);
           break;
         
         case 'full-json-result':
           navigator.clipboard.writeText(fullJson).then(() => {
-            setIsCopied(true);
-            setTimeout(() => setIsCopied(false), 2000);
+            if (view === 'main') {
+                setIsMainCopied(true);
+                setTimeout(() => setIsMainCopied(false), 2000);
+            } else {
+                setIsSubsetCopied(true);
+                setTimeout(() => setIsSubsetCopied(false), 2000);
+            }
+            setStatus('ready');
           });
-          setStatus('ready');
           break;
 
         case 'error':
@@ -179,7 +293,8 @@ const App: React.FC = () => {
           setFileName(null);
           setTotalCount(0);
           setFilteredCount(0);
-          setResultsString('');
+          setMainResultsString('');
+          setSubsetResultsString('');
           setStatus('error');
           break;
       }
@@ -195,15 +310,25 @@ const App: React.FC = () => {
       workerRef.current?.terminate();
       URL.revokeObjectURL(workerUrl);
     };
-  }, []);
+  }, [requestPage]);
+
+  // Live update filtered view when selected languages change
+  useEffect(() => {
+    if (status === 'ready') {
+        setSubsetResultsString('');
+        requestPage(0, 'subset');
+    }
+  }, [selectedLanguages, status, requestPage]);
   
   const handleApplyFilters = useCallback(() => {
-    if (status === 'idle' || status === 'loading' || status === 'filtering') return;
+    if (status === 'loading') return;
     
-    jobIdRef.current = Date.now(); // Create a new job ID for this filter operation
+    // Start filter job
+    jobIdRef.current = Date.now();
     setStatus('filtering');
-    setResultsString(''); // Clear previous results for instant feedback
-    setHasMore(false);
+    setMainResultsString(''); 
+    setSubsetResultsString('');
+    
     workerRef.current?.postMessage({
         type: 'filter',
         jobId: jobIdRef.current,
@@ -211,11 +336,18 @@ const App: React.FC = () => {
     });
   }, [status, sourceSearch, targetSearch]);
 
-  const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-      if (event.key === 'Enter') {
-          handleApplyFilters();
+  const handleLanguageChange = (lang: string) => {
+      const newSet = new Set(selectedLanguages);
+      if (newSet.has(lang)) {
+          newSet.delete(lang);
+      } else {
+          newSet.add(lang);
       }
+      setSelectedLanguages(newSet);
   };
+  
+  const handleSelectAll = () => setSelectedLanguages(new Set(availableLanguages));
+  const handleDeselectAll = () => setSelectedLanguages(new Set());
 
   const processFile = (file: File) => {
     setFileName(file.name);
@@ -223,11 +355,14 @@ const App: React.FC = () => {
     setStatus('loading');
     setTotalCount(0);
     setFilteredCount(0);
-    setResultsString('');
+    setMainResultsString('');
+    setSubsetResultsString('');
     setSourceSearch('');
     setTargetSearch('');
-    setHasMore(false);
-    jobIdRef.current = Date.now(); // Create a new job ID for the file load
+    setAvailableLanguages([]);
+    setSelectedLanguages(new Set());
+    
+    jobIdRef.current = Date.now();
 
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -246,65 +381,59 @@ const App: React.FC = () => {
     if (file) processFile(file);
   };
   
-  const handleCopy = useCallback(() => {
-    if (!resultsString || status !== 'ready') return;
+  const handleCopy = (view: 'main' | 'subset') => {
+    if (status !== 'ready') return;
     setStatus('copying');
-    jobIdRef.current = Date.now();
+    // Use Ref here as well for consistency, although state would work in this context
     workerRef.current?.postMessage({
-        type: 'get-full-filtered-json',
-        jobId: jobIdRef.current
+        type: 'get-full-json',
+        jobId: jobIdRef.current,
+        payload: { view, selectedLanguages: Array.from(selectedLanguagesRef.current) }
     });
-  }, [resultsString, status]);
+  };
 
-  const handleScroll = useCallback(() => {
-    if (!preRef.current || !hasMore || status !== 'ready') return;
+  const handleScroll = (view: 'main' | 'subset') => {
+    const ref = view === 'main' ? mainPreRef : subsetPreRef;
+    const hasMore = view === 'main' ? mainHasMore : subsetHasMore;
+    const currentPage = view === 'main' ? mainCurrentPage : subsetCurrentPage;
 
-    const { scrollTop, scrollHeight, clientHeight } = preRef.current;
+    if (!ref.current || !hasMore || status !== 'ready') return;
+
+    const { scrollTop, scrollHeight, clientHeight } = ref.current;
     if (scrollHeight - scrollTop < clientHeight * 1.5) {
-      // Don't change status, just fetch more data
-      workerRef.current?.postMessage({
-        type: 'get-next-page',
-        jobId: jobIdRef.current, // Use current job ID for pagination
-        payload: { page: currentPage + 1 }
-      });
+      requestPage(currentPage + 1, view);
     }
-  }, [hasMore, status, currentPage]);
-
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDragging(true);
   };
 
-  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsDragging(false);
-  };
-
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => { e.preventDefault(); setIsDragging(true); };
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => { e.preventDefault(); setIsDragging(false); };
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
-    if (file && file.type === 'application/json') {
-      processFile(file);
-    } else {
-      setError('Invalid file type. Please drop a JSON file.');
-    }
+    if (file && file.type === 'application/json') processFile(file);
+    else setError('Invalid file type. Please drop a JSON file.');
   };
 
-
-  const renderContent = () => {
-    if (status === 'loading') return <span className="text-gray-500 flex items-center justify-center h-full">Processing file...</span>;
-    if (status === 'idle') return <span className="text-gray-500 flex items-center justify-center h-full">Upload a JSON file to see the results.</span>;
-    if (status === 'filtering') return <span className="text-gray-500 flex items-center justify-center h-full">Filtering...</span>;
+  const renderContent = (view: 'main' | 'subset') => {
+    if (status === 'loading') return <span className="text-gray-500 flex items-center justify-center h-full">Processing...</span>;
+    if (status === 'idle') return <span className="text-gray-500 flex items-center justify-center h-full">Waiting for file...</span>;
     
     if (filteredCount === 0) {
-      if (sourceSearch || targetSearch) return <span className="text-gray-500 flex items-center justify-center h-full">No results match your criteria.</span>;
       return <code>[]</code>;
     }
+    
+    const resultsStr = view === 'main' ? mainResultsString : subsetResultsString;
+    const hasMore = view === 'main' ? mainHasMore : subsetHasMore;
+
+    if (!resultsStr && status === 'filtering') return <span className="text-gray-500 flex items-center justify-center h-full">Filtering...</span>;
 
     const moreIndicator = hasMore ? `,\n  // Scrolling will load more results...` : '';
-    return <code>{`[\n${resultsString}${moreIndicator}\n]`}</code>
+    return <code>{`[\n${resultsStr}${moreIndicator}\n]`}</code>
   };
+
+  const selectedLangsList = Array.from(selectedLanguages).sort().map(l => getDisplayName(l)).join(', ');
+  const selectedLangsSummary = selectedLangsList.length > 50 ? selectedLangsList.substring(0, 50) + '...' : selectedLangsList;
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-200 font-sans p-4 sm:p-6 lg:p-8">
@@ -314,109 +443,162 @@ const App: React.FC = () => {
           <p className="text-gray-400 mt-2">Upload, search, and manage your multilingual translation files with ease.</p>
         </header>
 
-        <main className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          <div className="bg-gray-800 p-6 rounded-lg shadow-lg flex flex-col gap-6 h-fit">
-            <div>
-                <h2 className="text-2xl font-semibold text-white mb-4 border-b border-gray-700 pb-2">Controls</h2>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2" htmlFor="file-upload">
-                Upload JSON File
-              </label>
-              <div
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-md transition-colors ${isDragging ? 'border-cyan-400' : 'border-gray-600'}`}
-              >
-                <div className="space-y-1 text-center">
-                  <svg className="mx-auto h-12 w-12 text-gray-500" stroke="currentColor" fill="none" viewBox="0 0 48 48" aria-hidden="true"><path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                  <div className="flex text-sm text-gray-500">
-                    <label htmlFor="file-upload" className={`relative cursor-pointer bg-gray-800 rounded-md font-medium text-cyan-400 hover:text-cyan-300 focus-within:outline-none focus-within:ring-2 focus-within:ring-offset-2 focus-within:ring-offset-gray-800 focus-within:ring-cyan-500 ${status === 'loading' ? 'opacity-50 cursor-not-allowed' : ''}`}>
-                      <span>Upload a file</span>
-                      <input id="file-upload" name="file-upload" type="file" className="sr-only" accept=".json" onChange={handleFileChange} disabled={status === 'loading'}/>
-                    </label>
-                    <p className="pl-1">or drag and drop</p>
-                  </div>
-                  <p className="text-xs text-gray-600">JSON files only</p>
+        <main className="grid grid-cols-1 lg:grid-cols-[400px_1fr] gap-8">
+          {/* Controls Column */}
+          <div className="flex flex-col gap-6">
+             <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-6">
+                <div>
+                    <h2 className="text-xl font-semibold text-white mb-4 border-b border-gray-700 pb-2">Controls</h2>
+                    
+                    {/* File Upload */}
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Upload JSON File</label>
+                    <div
+                        onDragOver={handleDragOver}
+                        onDragLeave={handleDragLeave}
+                        onDrop={handleDrop}
+                        className={`flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-md transition-colors ${isDragging ? 'border-cyan-400' : 'border-gray-600'}`}
+                    >
+                        <div className="space-y-1 text-center">
+                            <svg className="mx-auto h-10 w-10 text-gray-500" stroke="currentColor" fill="none" viewBox="0 0 48 48"><path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                            <div className="flex text-sm text-gray-500">
+                                <label className={`relative cursor-pointer bg-gray-800 rounded-md font-medium text-cyan-400 hover:text-cyan-300 focus-within:outline-none ${status === 'loading' ? 'opacity-50' : ''}`}>
+                                    <span>Upload a file</span>
+                                    <input type="file" className="sr-only" accept=".json" onChange={handleFileChange} disabled={status === 'loading'}/>
+                                </label>
+                                <p className="pl-1">or drag and drop</p>
+                            </div>
+                            <p className="text-xs text-gray-600">JSON files only</p>
+                        </div>
+                    </div>
+                    {fileName && status !== 'loading' && status !== 'error' && <p className="text-sm text-green-400 mt-2">Loaded: {fileName} ({totalCount} items)</p>}
+                    {status === 'loading' && <p className="text-sm text-yellow-400 mt-2">Processing {fileName}...</p>}
+                    {error && <p className="text-sm text-red-400 mt-2">{error}</p>}
                 </div>
-              </div>
-              {fileName && status !== 'loading' && status !== 'error' && <p className="text-sm text-green-400 mt-2">Loaded: {fileName} ({totalCount} items)</p>}
-              {status === 'loading' && <p className="text-sm text-yellow-400 mt-2">Loading and processing {fileName}...</p>}
-              {error && <p className="text-sm text-red-400 mt-2">{error}</p>}
-            </div>
 
-            <div>
-              <label htmlFor="source-search" className="block text-sm font-medium text-gray-300">
-                Search in Source (en-US)
-              </label>
-              <input
-                type="text"
-                id="source-search"
-                value={sourceSearch}
-                onChange={(e) => setSourceSearch(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="e.g., Hello world"
-                className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
-                disabled={status === 'idle' || status === 'loading'}
-              />
-            </div>
-            <div>
-              <label htmlFor="target-search" className="block text-sm font-medium text-gray-300">
-                Search in Target Translations
-              </label>
-              <input
-                type="text"
-                id="target-search"
-                value={targetSearch}
-                onChange={(e) => setTargetSearch(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="e.g., Bonjour le monde"
-                className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
-                disabled={status === 'idle' || status === 'loading'}
-              />
-            </div>
-            <div className="pt-2">
-                <button
-                    onClick={handleApplyFilters}
-                    disabled={status === 'idle' || status === 'loading' || status === 'filtering'}
-                    className="w-full inline-flex items-center justify-center px-4 py-2 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-cyan-600 hover:bg-cyan-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-cyan-500 disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors duration-200"
-                >
-                    {status === 'filtering' ? 'Filtering...' : 'Apply Filters'}
-                </button>
-            </div>
+                {/* Search Controls */}
+                <div className="space-y-4">
+                    <div>
+                        <label htmlFor="source-search" className="block text-sm font-medium text-gray-300">Search in Source (en-US)</label>
+                        <input
+                            type="text"
+                            id="source-search"
+                            value={sourceSearch}
+                            onChange={(e) => setSourceSearch(e.target.value)}
+                            placeholder="e.g., Hello world"
+                            className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md py-2 px-3 text-white focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
+                            disabled={status === 'idle' || status === 'loading'}
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="target-search" className="block text-sm font-medium text-gray-300">Search in Target</label>
+                        <input
+                            type="text"
+                            id="target-search"
+                            value={targetSearch}
+                            onChange={(e) => setTargetSearch(e.target.value)}
+                            placeholder="e.g., Bonjour"
+                            className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md py-2 px-3 text-white focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
+                            disabled={status === 'idle' || status === 'loading'}
+                        />
+                    </div>
+                </div>
+
+                {/* Language Filter */}
+                {availableLanguages.length > 0 && (
+                    <div className="border-t border-gray-700 pt-4">
+                         <label className="block text-sm font-medium text-gray-300 mb-2">Filter by Language</label>
+                         <div className="flex gap-2 mb-2">
+                             <button onClick={handleSelectAll} className="text-xs bg-gray-700 hover:bg-gray-600 text-white py-1 px-3 rounded transition">Select All</button>
+                             <button onClick={handleDeselectAll} className="text-xs bg-gray-700 hover:bg-gray-600 text-white py-1 px-3 rounded transition">Deselect All</button>
+                         </div>
+                         <div className="max-h-60 overflow-y-auto bg-gray-900 rounded border border-gray-700 p-2 custom-scrollbar">
+                            {sortedLanguages.map(lang => (
+                                <div key={lang} className="flex items-center mb-1.5">
+                                    <input
+                                        id={`lang-${lang}`}
+                                        type="checkbox"
+                                        checked={selectedLanguages.has(lang)}
+                                        onChange={() => handleLanguageChange(lang)}
+                                        className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    />
+                                    <label htmlFor={`lang-${lang}`} className="ml-2 block text-sm text-gray-300 cursor-pointer select-none">
+                                        {getDisplayName(lang)}
+                                    </label>
+                                </div>
+                            ))}
+                         </div>
+                         <p className="text-xs text-gray-500 mt-1">{selectedLanguages.size} languages selected</p>
+                    </div>
+                )}
+
+                <div className="pt-2">
+                    <button
+                        onClick={handleApplyFilters}
+                        disabled={status === 'idle' || status === 'loading' || status === 'filtering'}
+                        className="w-full inline-flex items-center justify-center px-4 py-2 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-cyan-600 hover:bg-cyan-700 focus:outline-none disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors duration-200"
+                    >
+                        {status === 'filtering' ? 'Filtering...' : 'Apply Filters'}
+                    </button>
+                </div>
+             </div>
           </div>
 
-          <div className="bg-gray-800 rounded-lg shadow-lg flex flex-col">
-            <div className="flex justify-between items-center p-4 border-b border-gray-700">
-              <h2 className="text-xl font-semibold text-white">Results ({status === 'filtering' ? '...' : filteredCount})</h2>
-              <button
-                onClick={handleCopy}
-                disabled={isCopied || status !== 'ready' || !resultsString}
-                className={`inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white ${
-                  isCopied
-                    ? 'bg-green-600'
-                    : 'bg-cyan-600 hover:bg-cyan-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-cyan-500'
-                } disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors duration-200`}
-              >
-                {isCopied ? (
-                  <>
-                    <CheckIcon className="h-5 w-5 mr-2" />
-                    Copied!
-                  </>
-                ) : (
-                  <>
-                    <ClipboardIcon className="h-5 w-5 mr-2" />
-                    {status === 'copying' ? 'Preparing...' : 'Copy JSON'}
-                  </>
-                )}
-              </button>
+          {/* Results Column */}
+          <div className="flex flex-col gap-8">
+            
+            {/* Main Results Panel */}
+            <div className="bg-gray-800 rounded-lg shadow-lg flex flex-col h-[400px]">
+                <div className="flex justify-between items-center p-4 border-b border-gray-700 bg-gray-800 rounded-t-lg">
+                  <h2 className="text-lg font-semibold text-white">Results ({filteredCount})</h2>
+                  <button
+                    onClick={() => handleCopy('main')}
+                    disabled={isMainCopied || status !== 'ready' || !mainResultsString}
+                    className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                      isMainCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
+                    } disabled:opacity-50 transition-colors`}
+                  >
+                    {isMainCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy JSON</>}
+                  </button>
+                </div>
+                <div className="flex-grow overflow-hidden relative">
+                  <pre 
+                    ref={mainPreRef} 
+                    onScroll={() => handleScroll('main')} 
+                    className="absolute inset-0 overflow-auto bg-gray-900 text-xs sm:text-sm p-4 custom-scrollbar"
+                  >
+                      {renderContent('main')}
+                  </pre>
+                </div>
             </div>
-            <div className="flex-grow p-1 overflow-hidden">
-              <pre ref={preRef} onScroll={handleScroll} className="w-full h-[60vh] overflow-auto bg-gray-900 text-sm p-4 rounded-b-md custom-scrollbar">
-                  {renderContent()}
-              </pre>
+
+            {/* Filtered Results Panel */}
+            <div className="bg-gray-800 rounded-lg shadow-lg flex flex-col h-[400px]">
+                <div className="flex justify-between items-center p-4 border-b border-gray-700 bg-gray-800 rounded-t-lg">
+                  <div className="flex flex-col">
+                      <h2 className="text-lg font-semibold text-white">Filtered Results ({filteredCount})</h2>
+                      {selectedLanguages.size > 0 && <span className="text-xs text-gray-400 block truncate max-w-[300px]">{selectedLangsSummary}</span>}
+                  </div>
+                  <button
+                    onClick={() => handleCopy('subset')}
+                    disabled={isSubsetCopied || status !== 'ready' || !subsetResultsString}
+                    className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                      isSubsetCopied ? 'bg-green-600' : 'bg-cyan-600 hover:bg-cyan-700'
+                    } disabled:opacity-50 transition-colors`}
+                  >
+                    {isSubsetCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy JSON</>}
+                  </button>
+                </div>
+                <div className="flex-grow overflow-hidden relative">
+                  <pre 
+                    ref={subsetPreRef} 
+                    onScroll={() => handleScroll('subset')} 
+                    className="absolute inset-0 overflow-auto bg-gray-900 text-xs sm:text-sm p-4 custom-scrollbar"
+                  >
+                      {renderContent('subset')}
+                  </pre>
+                </div>
             </div>
+
           </div>
         </main>
       </div>
