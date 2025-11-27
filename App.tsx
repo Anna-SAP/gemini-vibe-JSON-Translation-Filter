@@ -135,6 +135,43 @@ const workerCode = `
           const fullJson = JSON.stringify(fullJsonData, null, 2);
           self.postMessage({ type: 'full-json-result', fullJson, view: jsonView, jobId });
           break;
+
+        case 'get-translated-json':
+          const { selectedLanguages: transLangs } = payload;
+          const translatedData = currentFilteredTranslations.reduce((acc, item) => {
+              const newItem = { key: item.key };
+              let hasNonEnglishTranslation = false;
+              
+              if (Array.isArray(transLangs)) {
+                  transLangs.forEach(lang => {
+                      if (item[lang] !== undefined) {
+                          newItem[lang] = item[lang];
+                          // Check if this is a non-English language with content
+                          if (lang !== 'en-US') {
+                              hasNonEnglishTranslation = true;
+                          }
+                      }
+                  });
+              }
+              
+              // Only add to result if we found at least one non-English translation
+              if (hasNonEnglishTranslation) {
+                  acc.push(newItem);
+              }
+              return acc;
+          }, []);
+          
+          const translatedJson = JSON.stringify(translatedData, null, 2);
+          self.postMessage({ type: 'translated-json-result', translatedJson, jobId });
+          break;
+
+        case 'get-all-keys':
+          const keysList = currentFilteredTranslations
+              .map(item => item.key)
+              .filter(k => k !== undefined && k !== null)
+              .join('\\n');
+          self.postMessage({ type: 'all-keys-result', keysList, jobId });
+          break;
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
@@ -173,6 +210,8 @@ const App: React.FC = () => {
   const [subsetHasMore, setSubsetHasMore] = useState(false);
   const [subsetCurrentPage, setSubsetCurrentPage] = useState(0);
   const [isSubsetCopied, setIsSubsetCopied] = useState(false);
+  const [isSubsetKeysCopied, setIsSubsetKeysCopied] = useState(false);
+  const [isTranslatedCopied, setIsTranslatedCopied] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
   const mainPreRef = useRef<HTMLPreElement | null>(null);
@@ -229,7 +268,7 @@ const App: React.FC = () => {
     workerRef.current = new Worker(workerUrl);
 
     workerRef.current.onmessage = (event: MessageEvent<{ type: string; jobId?: number; [key: string]: any }>) => {
-      const { type, jobId, results, count, total, hasMore, page, message, fullJson, languages, view } = event.data;
+      const { type, jobId, results, count, total, hasMore, page, message, fullJson, translatedJson, languages, view, keysList } = event.data;
 
       if (jobId !== undefined && jobId !== jobIdRef.current) return;
 
@@ -285,6 +324,22 @@ const App: React.FC = () => {
                 setTimeout(() => setIsSubsetCopied(false), 2000);
             }
             setStatus('ready');
+          });
+          break;
+
+        case 'translated-json-result':
+          navigator.clipboard.writeText(translatedJson).then(() => {
+              setIsTranslatedCopied(true);
+              setTimeout(() => setIsTranslatedCopied(false), 2000);
+              setStatus('ready');
+          });
+          break;
+        
+        case 'all-keys-result':
+          navigator.clipboard.writeText(keysList).then(() => {
+              setIsSubsetKeysCopied(true);
+              setTimeout(() => setIsSubsetKeysCopied(false), 2000);
+              setStatus('ready');
           });
           break;
 
@@ -389,6 +444,25 @@ const App: React.FC = () => {
         type: 'get-full-json',
         jobId: jobIdRef.current,
         payload: { view, selectedLanguages: Array.from(selectedLanguagesRef.current) }
+    });
+  };
+
+  const handleCopyKeys = () => {
+    if (status !== 'ready') return;
+    setStatus('copying');
+    workerRef.current?.postMessage({
+        type: 'get-all-keys',
+        jobId: jobIdRef.current
+    });
+  };
+
+  const handleCopyTranslated = () => {
+    if (status !== 'ready') return;
+    setStatus('copying');
+    workerRef.current?.postMessage({
+        type: 'get-translated-json',
+        jobId: jobIdRef.current,
+        payload: { selectedLanguages: Array.from(selectedLanguagesRef.current) }
     });
   };
 
@@ -578,15 +652,35 @@ const App: React.FC = () => {
                       <h2 className="text-lg font-semibold text-white">Filtered Results ({filteredCount})</h2>
                       {selectedLanguages.size > 0 && <span className="text-xs text-gray-400 block truncate max-w-[300px]">{selectedLangsSummary}</span>}
                   </div>
-                  <button
-                    onClick={() => handleCopy('subset')}
-                    disabled={isSubsetCopied || status !== 'ready' || !subsetResultsString}
-                    className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
-                      isSubsetCopied ? 'bg-green-600' : 'bg-cyan-600 hover:bg-cyan-700'
-                    } disabled:opacity-50 transition-colors`}
-                  >
-                    {isSubsetCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy JSON</>}
-                  </button>
+                  <div className="flex flex-wrap gap-2 justify-end">
+                    <button
+                        onClick={handleCopyKeys}
+                        disabled={isSubsetKeysCopied || status !== 'ready' || !subsetResultsString}
+                        className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                        isSubsetKeysCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
+                        } disabled:opacity-50 transition-colors`}
+                    >
+                        {isSubsetKeysCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy Keys</>}
+                    </button>
+                    <button
+                        onClick={handleCopyTranslated}
+                        disabled={isTranslatedCopied || status !== 'ready' || !subsetResultsString}
+                        className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                        isTranslatedCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
+                        } disabled:opacity-50 transition-colors`}
+                    >
+                        {isTranslatedCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy Keys with Translation</>}
+                    </button>
+                    <button
+                        onClick={() => handleCopy('subset')}
+                        disabled={isSubsetCopied || status !== 'ready' || !subsetResultsString}
+                        className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                        isSubsetCopied ? 'bg-green-600' : 'bg-cyan-600 hover:bg-cyan-700'
+                        } disabled:opacity-50 transition-colors`}
+                    >
+                        {isSubsetCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy JSON</>}
+                    </button>
+                  </div>
                 </div>
                 <div className="flex-grow overflow-hidden relative">
                   <pre 
