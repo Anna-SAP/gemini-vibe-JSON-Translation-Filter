@@ -2,12 +2,16 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ClipboardIcon from './components/icons/ClipboardIcon';
 import CheckIcon from './components/icons/CheckIcon';
+import { TranslationObject } from './types';
 
 type Status = 'idle' | 'loading' | 'filtering' | 'ready' | 'error' | 'copying';
 
 const workerCode = `
   let allTranslations = [];
-  let currentFilteredTranslations = [];
+  let primaryFilteredTranslations = []; // Result of sidebar filters
+  let finalFilteredTranslations = []; // Result of primary + refine
+  let currentRefineQuery = '';
+
   const PAGE_SIZE = 50;
 
   const generatePage = (page, data, view, selectedLanguages) => {
@@ -30,8 +34,19 @@ const workerCode = `
          });
       }
 
-      const pageString = resultData.map(item => JSON.stringify(item, null, 2)).join(',\\n');
-      return { pageString, hasMore };
+      // Return raw objects now, not strings
+      return { results: resultData, hasMore };
+  };
+
+  const applyRefine = () => {
+     if (!currentRefineQuery) {
+         finalFilteredTranslations = primaryFilteredTranslations;
+     } else {
+         const lowerQuery = currentRefineQuery.toLowerCase();
+         finalFilteredTranslations = primaryFilteredTranslations.filter(item => 
+             JSON.stringify(item).toLowerCase().includes(lowerQuery)
+         );
+     }
   };
 
   self.onmessage = (event) => {
@@ -49,8 +64,9 @@ const workerCode = `
           }
           
           allTranslations = data;
-          // Reset filtered to all initially
-          currentFilteredTranslations = allTranslations;
+          primaryFilteredTranslations = allTranslations;
+          finalFilteredTranslations = allTranslations;
+          currentRefineQuery = '';
           
           // Extract languages from the first item
           const languages = data.length > 0 
@@ -60,56 +76,116 @@ const workerCode = `
           self.postMessage({ 
             type: 'loaded', 
             total: allTranslations.length, 
-            count: allTranslations.length, 
+            count: finalFilteredTranslations.length, 
             languages,
             jobId 
           });
           break;
 
         case 'filter':
-          const { sourceSearch, targetSearch } = payload;
+          const { 
+            keySearch,
+            sourceSearch, 
+            targetSearch, 
+            matchKeyWholeWord,
+            matchSourceWholeWord, 
+            matchTargetWholeWord,
+            matchKeyCase,
+            matchSourceCase,
+            matchTargetCase
+          } = payload;
+          
+          // Reset refine query when main filter changes
+          currentRefineQuery = ''; 
           
           if (!allTranslations.length) {
-              currentFilteredTranslations = [];
+              primaryFilteredTranslations = [];
           } else {
-              const lowerSourceSearch = sourceSearch.trim().toLowerCase();
-              const lowerTargetSearch = targetSearch.trim().toLowerCase();
+              // Pre-process search terms based on case sensitivity
+              const effectiveKeySearch = matchKeyCase ? keySearch : keySearch.toLowerCase();
+              const effectiveSourceSearch = matchSourceCase ? sourceSearch : sourceSearch.toLowerCase();
+              const effectiveTargetSearch = matchTargetCase ? targetSearch : targetSearch.toLowerCase();
 
-              if (!lowerSourceSearch && !lowerTargetSearch) {
-                  currentFilteredTranslations = allTranslations;
+              if (keySearch === '' && sourceSearch === '' && targetSearch === '') {
+                  primaryFilteredTranslations = allTranslations;
               } else {
-                   currentFilteredTranslations = allTranslations.filter(item => {
-                      const sourceMatch = lowerSourceSearch
-                          ? item['en-US']?.toLowerCase().includes(lowerSourceSearch)
-                          : true;
+                   primaryFilteredTranslations = allTranslations.filter(item => {
+                      // Key Logic
+                      let keyMatch = true;
+                      if (keySearch !== '') {
+                          const itemKey = item.key;
+                          if (typeof itemKey !== 'string') {
+                              keyMatch = false;
+                          } else {
+                              const effectiveItemKey = matchKeyCase ? itemKey : itemKey.toLowerCase();
+                              if (matchKeyWholeWord) {
+                                  keyMatch = effectiveItemKey === effectiveKeySearch;
+                              } else {
+                                  keyMatch = effectiveItemKey.includes(effectiveKeySearch);
+                              }
+                          }
+                      }
+                      
+                      if (!keyMatch) return false;
+
+                      // Source Logic
+                      let sourceMatch = true;
+                      if (sourceSearch !== '') {
+                          const itemValue = item['en-US'];
+                          if (typeof itemValue !== 'string') {
+                              sourceMatch = false;
+                          } else {
+                              const effectiveItemValue = matchSourceCase ? itemValue : itemValue.toLowerCase();
+                              if (matchSourceWholeWord) {
+                                  sourceMatch = effectiveItemValue === effectiveSourceSearch;
+                              } else {
+                                  sourceMatch = effectiveItemValue.includes(effectiveSourceSearch);
+                              }
+                          }
+                      }
 
                       if (!sourceMatch) return false;
 
-                      const targetMatch = lowerTargetSearch
-                          ? Object.entries(item).some(([key, value]) => {
+                      // Target Logic
+                      let targetMatch = true;
+                      if (targetSearch !== '') {
+                          targetMatch = Object.entries(item).some(([key, value]) => {
                               if (key === 'key' || key === 'en-US' || typeof value !== 'string') {
                               return false;
                               }
-                              return value.toLowerCase().includes(lowerTargetSearch);
-                          })
-                          : true;
+                              
+                              const effectiveValue = matchTargetCase ? value : value.toLowerCase();
+                              if (matchTargetWholeWord) {
+                                  return effectiveValue === effectiveTargetSearch;
+                              }
+                              return effectiveValue.includes(effectiveTargetSearch);
+                          });
+                      }
 
                       return sourceMatch && targetMatch;
                   });
               }
           }
-          self.postMessage({ type: 'filtered', count: currentFilteredTranslations.length, jobId });
+          applyRefine();
+          self.postMessage({ type: 'filtered', count: finalFilteredTranslations.length, jobId });
+          break;
+
+        case 'refine':
+          currentRefineQuery = payload.query;
+          applyRefine();
+          self.postMessage({ type: 'filtered', count: finalFilteredTranslations.length, jobId });
           break;
 
         case 'get-page':
           const { page, view, selectedLanguages } = payload;
           // 'view' can be 'main' or 'subset'
-          const { pageString, hasMore } = generatePage(page, currentFilteredTranslations, view, selectedLanguages);
+          // We use finalFilteredTranslations for everything now
+          const { results, hasMore } = generatePage(page, finalFilteredTranslations, view, selectedLanguages);
           
           self.postMessage({
             type: 'page-data',
             view,
-            results: pageString,
+            results: results,
             hasMore,
             page,
             jobId
@@ -118,10 +194,10 @@ const workerCode = `
         
         case 'get-full-json':
           const { view: jsonView, selectedLanguages: jsonSelectedLangs } = payload;
-          let fullJsonData = currentFilteredTranslations;
+          let fullJsonData = finalFilteredTranslations;
           
           if (jsonView === 'subset' && Array.isArray(jsonSelectedLangs)) {
-             fullJsonData = currentFilteredTranslations.map(item => {
+             fullJsonData = finalFilteredTranslations.map(item => {
                 const newItem = { key: item.key };
                 jsonSelectedLangs.forEach(lang => {
                    if (item[lang] !== undefined) {
@@ -138,7 +214,7 @@ const workerCode = `
 
         case 'get-translated-json':
           const { selectedLanguages: transLangs } = payload;
-          const translatedData = currentFilteredTranslations.reduce((acc, item) => {
+          const translatedData = finalFilteredTranslations.reduce((acc, item) => {
               const newItem = { key: item.key };
               let hasNonEnglishTranslation = false;
               
@@ -166,7 +242,7 @@ const workerCode = `
           break;
 
         case 'get-all-keys':
-          const keysList = currentFilteredTranslations
+          const keysList = finalFilteredTranslations
               .map(item => item.key)
               .filter(k => k !== undefined && k !== null)
               .join('\\n');
@@ -181,8 +257,17 @@ const workerCode = `
 `;
 
 const App: React.FC = () => {
+  const [keySearch, setKeySearch] = useState('');
   const [sourceSearch, setSourceSearch] = useState('');
   const [targetSearch, setTargetSearch] = useState('');
+  const [matchKeyWholeWord, setMatchKeyWholeWord] = useState(false);
+  const [matchSourceWholeWord, setMatchSourceWholeWord] = useState(false);
+  const [matchTargetWholeWord, setMatchTargetWholeWord] = useState(false);
+  const [matchKeyCase, setMatchKeyCase] = useState(false);
+  const [matchSourceCase, setMatchSourceCase] = useState(false);
+  const [matchTargetCase, setMatchTargetCase] = useState(false);
+  const [refineQuery, setRefineQuery] = useState('');
+
   const [fileName, setFileName] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -200,13 +285,13 @@ const App: React.FC = () => {
   const [filteredCount, setFilteredCount] = useState(0);
 
   // Main Results State
-  const [mainResultsString, setMainResultsString] = useState('');
+  const [mainResults, setMainResults] = useState<TranslationObject[]>([]);
   const [mainHasMore, setMainHasMore] = useState(false);
   const [mainCurrentPage, setMainCurrentPage] = useState(0);
   const [isMainCopied, setIsMainCopied] = useState(false);
 
   // Filtered (Subset) Results State
-  const [subsetResultsString, setSubsetResultsString] = useState('');
+  const [subsetResults, setSubsetResults] = useState<TranslationObject[]>([]);
   const [subsetHasMore, setSubsetHasMore] = useState(false);
   const [subsetCurrentPage, setSubsetCurrentPage] = useState(0);
   const [isSubsetCopied, setIsSubsetCopied] = useState(false);
@@ -214,8 +299,8 @@ const App: React.FC = () => {
   const [isTranslatedCopied, setIsTranslatedCopied] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
-  const mainPreRef = useRef<HTMLPreElement | null>(null);
-  const subsetPreRef = useRef<HTMLPreElement | null>(null);
+  const mainPreRef = useRef<HTMLDivElement | null>(null);
+  const subsetPreRef = useRef<HTMLDivElement | null>(null);
   const jobIdRef = useRef<number>(0);
 
   // Update the ref whenever state changes
@@ -290,8 +375,8 @@ const App: React.FC = () => {
         case 'filtered':
           setFilteredCount(count);
           // Clear current displays
-          setMainResultsString('');
-          setSubsetResultsString('');
+          setMainResults([]);
+          setSubsetResults([]);
           // Request first pages - this will now use the selectedLanguagesRef
           requestPage(0, 'main');
           requestPage(0, 'subset');
@@ -304,11 +389,11 @@ const App: React.FC = () => {
 
         case 'page-data':
           if (view === 'main') {
-             setMainResultsString(prev => (page === 0 ? results : (prev ? `${prev},\n${results}` : results)));
+             setMainResults(prev => (page === 0 ? results : [...prev, ...results]));
              setMainHasMore(hasMore);
              setMainCurrentPage(page);
           } else if (view === 'subset') {
-             setSubsetResultsString(prev => (page === 0 ? results : (prev ? `${prev},\n${results}` : results)));
+             setSubsetResults(prev => (page === 0 ? results : [...prev, ...results]));
              setSubsetHasMore(hasMore);
              setSubsetCurrentPage(page);
           }
@@ -348,8 +433,8 @@ const App: React.FC = () => {
           setFileName(null);
           setTotalCount(0);
           setFilteredCount(0);
-          setMainResultsString('');
-          setSubsetResultsString('');
+          setMainResults([]);
+          setSubsetResults([]);
           setStatus('error');
           break;
       }
@@ -370,7 +455,7 @@ const App: React.FC = () => {
   // Live update filtered view when selected languages change
   useEffect(() => {
     if (status === 'ready') {
-        setSubsetResultsString('');
+        setSubsetResults([]);
         requestPage(0, 'subset');
     }
   }, [selectedLanguages, status, requestPage]);
@@ -381,15 +466,42 @@ const App: React.FC = () => {
     // Start filter job
     jobIdRef.current = Date.now();
     setStatus('filtering');
-    setMainResultsString(''); 
-    setSubsetResultsString('');
+    setMainResults([]); 
+    setSubsetResults([]);
+    setRefineQuery(''); // Reset refine query on new search
     
     workerRef.current?.postMessage({
         type: 'filter',
         jobId: jobIdRef.current,
-        payload: { sourceSearch, targetSearch },
+        payload: { 
+          keySearch,
+          sourceSearch, 
+          targetSearch, 
+          matchKeyWholeWord,
+          matchSourceWholeWord, 
+          matchTargetWholeWord,
+          matchKeyCase,
+          matchSourceCase,
+          matchTargetCase
+        },
     });
-  }, [status, sourceSearch, targetSearch]);
+  }, [status, keySearch, sourceSearch, targetSearch, matchKeyWholeWord, matchSourceWholeWord, matchTargetWholeWord, matchKeyCase, matchSourceCase, matchTargetCase]);
+
+  const handleRefineSearch = useCallback((query: string) => {
+    setRefineQuery(query);
+    if (status === 'loading') return;
+    
+    jobIdRef.current = Date.now();
+    setStatus('filtering');
+    setMainResults([]); 
+    setSubsetResults([]);
+    
+    workerRef.current?.postMessage({
+        type: 'refine',
+        jobId: jobIdRef.current,
+        payload: { query },
+    });
+  }, [status]);
 
   const handleLanguageChange = (lang: string) => {
       const newSet = new Set(selectedLanguages);
@@ -410,10 +522,18 @@ const App: React.FC = () => {
     setStatus('loading');
     setTotalCount(0);
     setFilteredCount(0);
-    setMainResultsString('');
-    setSubsetResultsString('');
+    setMainResults([]);
+    setSubsetResults([]);
+    setKeySearch('');
     setSourceSearch('');
     setTargetSearch('');
+    setRefineQuery('');
+    setMatchKeyWholeWord(false);
+    setMatchSourceWholeWord(false);
+    setMatchTargetWholeWord(false);
+    setMatchKeyCase(false);
+    setMatchSourceCase(false);
+    setMatchTargetCase(false);
     setAvailableLanguages([]);
     setSelectedLanguages(new Set());
     
@@ -497,13 +617,28 @@ const App: React.FC = () => {
       return <code>[]</code>;
     }
     
-    const resultsStr = view === 'main' ? mainResultsString : subsetResultsString;
+    const results = view === 'main' ? mainResults : subsetResults;
     const hasMore = view === 'main' ? mainHasMore : subsetHasMore;
 
-    if (!resultsStr && status === 'filtering') return <span className="text-gray-500 flex items-center justify-center h-full">Filtering...</span>;
+    if (results.length === 0 && status === 'filtering') return <span className="text-gray-500 flex items-center justify-center h-full">Filtering...</span>;
 
-    const moreIndicator = hasMore ? `,\n  // Scrolling will load more results...` : '';
-    return <code>{`[\n${resultsStr}${moreIndicator}\n]`}</code>
+    return (
+        <div className="font-mono text-xs sm:text-sm">
+            <div className="text-gray-500">{'['}</div>
+            {results.map((item, index) => (
+                <div key={index} className="flex group hover:bg-gray-700/30 rounded-sm">
+                    <div className="select-none text-gray-500 w-10 text-right pr-3 flex-shrink-0 opacity-50 py-0.5" aria-hidden="true">
+                        {index + 1}
+                    </div>
+                    <div className="flex-grow min-w-0">
+                        <pre className="whitespace-pre-wrap break-all">{JSON.stringify(item, null, 2)}{index < filteredCount - 1 ? ',' : ''}</pre>
+                    </div>
+                </div>
+            ))}
+            {hasMore && <div className="text-gray-500 pl-12 py-2">// Scroll to load more results...</div>}
+            <div className="text-gray-500">{']'}</div>
+        </div>
+    );
   };
 
   const selectedLangsList = Array.from(selectedLanguages).sort().map(l => getDisplayName(l)).join(', ');
@@ -552,6 +687,47 @@ const App: React.FC = () => {
                 {/* Search Controls */}
                 <div className="space-y-4">
                     <div>
+                        <label htmlFor="key-search" className="block text-sm font-medium text-gray-300">Search by Key</label>
+                        <input
+                            type="text"
+                            id="key-search"
+                            value={keySearch}
+                            onChange={(e) => setKeySearch(e.target.value)}
+                            placeholder="e.g., RingCentral.analyticsPortal"
+                            className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md py-2 px-3 text-white focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
+                            disabled={status === 'idle' || status === 'loading'}
+                        />
+                        <div className="flex flex-wrap gap-x-4 mt-2">
+                            <div className="flex items-center">
+                                <input
+                                    id="match-key-whole-word"
+                                    type="checkbox"
+                                    checked={matchKeyWholeWord}
+                                    onChange={(e) => setMatchKeyWholeWord(e.target.checked)}
+                                    className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    disabled={status === 'idle' || status === 'loading'}
+                                />
+                                <label htmlFor="match-key-whole-word" className="ml-2 block text-sm text-gray-300 select-none cursor-pointer">
+                                    Match whole word
+                                </label>
+                            </div>
+                            <div className="flex items-center">
+                                <input
+                                    id="match-key-case"
+                                    type="checkbox"
+                                    checked={matchKeyCase}
+                                    onChange={(e) => setMatchKeyCase(e.target.checked)}
+                                    className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    disabled={status === 'idle' || status === 'loading'}
+                                />
+                                <label htmlFor="match-key-case" className="ml-2 block text-sm text-gray-300 select-none cursor-pointer">
+                                    Match case
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div>
                         <label htmlFor="source-search" className="block text-sm font-medium text-gray-300">Search in Source (en-US)</label>
                         <input
                             type="text"
@@ -562,6 +738,34 @@ const App: React.FC = () => {
                             className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md py-2 px-3 text-white focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
                             disabled={status === 'idle' || status === 'loading'}
                         />
+                        <div className="flex flex-wrap gap-x-4 mt-2">
+                            <div className="flex items-center">
+                                <input
+                                    id="match-source-whole-word"
+                                    type="checkbox"
+                                    checked={matchSourceWholeWord}
+                                    onChange={(e) => setMatchSourceWholeWord(e.target.checked)}
+                                    className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    disabled={status === 'idle' || status === 'loading'}
+                                />
+                                <label htmlFor="match-source-whole-word" className="ml-2 block text-sm text-gray-300 select-none cursor-pointer">
+                                    Match whole word
+                                </label>
+                            </div>
+                            <div className="flex items-center">
+                                <input
+                                    id="match-source-case"
+                                    type="checkbox"
+                                    checked={matchSourceCase}
+                                    onChange={(e) => setMatchSourceCase(e.target.checked)}
+                                    className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    disabled={status === 'idle' || status === 'loading'}
+                                />
+                                <label htmlFor="match-source-case" className="ml-2 block text-sm text-gray-300 select-none cursor-pointer">
+                                    Match case
+                                </label>
+                            </div>
+                        </div>
                     </div>
                     <div>
                         <label htmlFor="target-search" className="block text-sm font-medium text-gray-300">Search in Target</label>
@@ -574,6 +778,34 @@ const App: React.FC = () => {
                             className="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md py-2 px-3 text-white focus:ring-cyan-500 focus:border-cyan-500 sm:text-sm"
                             disabled={status === 'idle' || status === 'loading'}
                         />
+                         <div className="flex flex-wrap gap-x-4 mt-2">
+                            <div className="flex items-center">
+                                <input
+                                    id="match-target-whole-word"
+                                    type="checkbox"
+                                    checked={matchTargetWholeWord}
+                                    onChange={(e) => setMatchTargetWholeWord(e.target.checked)}
+                                    className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    disabled={status === 'idle' || status === 'loading'}
+                                />
+                                <label htmlFor="match-target-whole-word" className="ml-2 block text-sm text-gray-300 select-none cursor-pointer">
+                                    Match whole word
+                                </label>
+                            </div>
+                            <div className="flex items-center">
+                                <input
+                                    id="match-target-case"
+                                    type="checkbox"
+                                    checked={matchTargetCase}
+                                    onChange={(e) => setMatchTargetCase(e.target.checked)}
+                                    className="h-4 w-4 text-cyan-600 focus:ring-cyan-500 border-gray-600 rounded bg-gray-700"
+                                    disabled={status === 'idle' || status === 'loading'}
+                                />
+                                <label htmlFor="match-target-case" className="ml-2 block text-sm text-gray-300 select-none cursor-pointer">
+                                    Match case
+                                </label>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -626,7 +858,7 @@ const App: React.FC = () => {
                   <h2 className="text-lg font-semibold text-white">Results ({filteredCount})</h2>
                   <button
                     onClick={() => handleCopy('main')}
-                    disabled={isMainCopied || status !== 'ready' || !mainResultsString}
+                    disabled={isMainCopied || status !== 'ready' || mainResults.length === 0}
                     className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
                       isMainCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
                     } disabled:opacity-50 transition-colors`}
@@ -635,61 +867,76 @@ const App: React.FC = () => {
                   </button>
                 </div>
                 <div className="flex-grow overflow-hidden relative">
-                  <pre 
+                  <div 
                     ref={mainPreRef} 
                     onScroll={() => handleScroll('main')} 
                     className="absolute inset-0 overflow-auto bg-gray-900 text-xs sm:text-sm p-4 custom-scrollbar"
                   >
                       {renderContent('main')}
-                  </pre>
+                  </div>
                 </div>
             </div>
 
             {/* Filtered Results Panel */}
-            <div className="bg-gray-800 rounded-lg shadow-lg flex flex-col h-[400px]">
-                <div className="flex justify-between items-center p-4 border-b border-gray-700 bg-gray-800 rounded-t-lg">
-                  <div className="flex flex-col">
-                      <h2 className="text-lg font-semibold text-white">Filtered Results ({filteredCount})</h2>
-                      {selectedLanguages.size > 0 && <span className="text-xs text-gray-400 block truncate max-w-[300px]">{selectedLangsSummary}</span>}
+            <div className="bg-gray-800 rounded-lg shadow-lg flex flex-col h-[500px]">
+                <div className="flex flex-col p-4 border-b border-gray-700 bg-gray-800 rounded-t-lg gap-3">
+                  <div className="flex justify-between items-start">
+                    <div className="flex flex-col">
+                        <h2 className="text-lg font-semibold text-white">Filtered Results ({filteredCount})</h2>
+                        {selectedLanguages.size > 0 && <span className="text-xs text-gray-400 block truncate max-w-[300px]">{selectedLangsSummary}</span>}
+                    </div>
+                    <div className="flex flex-wrap gap-2 justify-end">
+                        <button
+                            onClick={handleCopyKeys}
+                            disabled={isSubsetKeysCopied || status !== 'ready' || subsetResults.length === 0}
+                            className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                            isSubsetKeysCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
+                            } disabled:opacity-50 transition-colors`}
+                        >
+                            {isSubsetKeysCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy Keys</>}
+                        </button>
+                        <button
+                            onClick={handleCopyTranslated}
+                            disabled={isTranslatedCopied || status !== 'ready' || subsetResults.length === 0}
+                            className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                            isTranslatedCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
+                            } disabled:opacity-50 transition-colors`}
+                        >
+                            {isTranslatedCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> w/ Trans</>}
+                        </button>
+                        <button
+                            onClick={() => handleCopy('subset')}
+                            disabled={isSubsetCopied || status !== 'ready' || subsetResults.length === 0}
+                            className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
+                            isSubsetCopied ? 'bg-green-600' : 'bg-cyan-600 hover:bg-cyan-700'
+                            } disabled:opacity-50 transition-colors`}
+                        >
+                            {isSubsetCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy JSON</>}
+                        </button>
+                    </div>
                   </div>
-                  <div className="flex flex-wrap gap-2 justify-end">
-                    <button
-                        onClick={handleCopyKeys}
-                        disabled={isSubsetKeysCopied || status !== 'ready' || !subsetResultsString}
-                        className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
-                        isSubsetKeysCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
-                        } disabled:opacity-50 transition-colors`}
-                    >
-                        {isSubsetKeysCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy Keys</>}
-                    </button>
-                    <button
-                        onClick={handleCopyTranslated}
-                        disabled={isTranslatedCopied || status !== 'ready' || !subsetResultsString}
-                        className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
-                        isTranslatedCopied ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
-                        } disabled:opacity-50 transition-colors`}
-                    >
-                        {isTranslatedCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy Keys with Translation</>}
-                    </button>
-                    <button
-                        onClick={() => handleCopy('subset')}
-                        disabled={isSubsetCopied || status !== 'ready' || !subsetResultsString}
-                        className={`inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded shadow-sm text-white ${
-                        isSubsetCopied ? 'bg-green-600' : 'bg-cyan-600 hover:bg-cyan-700'
-                        } disabled:opacity-50 transition-colors`}
-                    >
-                        {isSubsetCopied ? <><CheckIcon className="h-4 w-4 mr-1" /> Copied</> : <><ClipboardIcon className="h-4 w-4 mr-1" /> Copy JSON</>}
-                    </button>
+                  
+                  {/* Refine Search Input */}
+                  <div className="mt-1">
+                      <input 
+                          type="text"
+                          placeholder="Refine results (search again)..."
+                          value={refineQuery}
+                          onChange={(e) => handleRefineSearch(e.target.value)}
+                          className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-sm text-gray-200 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 placeholder-gray-500"
+                          disabled={status === 'idle' || (status !== 'ready' && status !== 'filtering')}
+                      />
                   </div>
                 </div>
+                
                 <div className="flex-grow overflow-hidden relative">
-                  <pre 
+                  <div 
                     ref={subsetPreRef} 
                     onScroll={() => handleScroll('subset')} 
                     className="absolute inset-0 overflow-auto bg-gray-900 text-xs sm:text-sm p-4 custom-scrollbar"
                   >
                       {renderContent('subset')}
-                  </pre>
+                  </div>
                 </div>
             </div>
 
