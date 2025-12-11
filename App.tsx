@@ -153,7 +153,6 @@ const workerCode = `
                           targetMatch = false;
                           
                           // Use detectedKeys to iterate only over known language columns
-                          // This avoids iterating over unexpected metadata fields or 'en-US' if we explicitly skip it
                           for (let i = 0; i < detectedKeys.length; i++) {
                               const langKey = detectedKeys[i];
                               
@@ -196,8 +195,6 @@ const workerCode = `
 
         case 'get-page':
           const { page, view, selectedLanguages } = payload;
-          // 'view' can be 'main' or 'subset'
-          // We use finalFilteredTranslations for everything now
           const { results, hasMore } = generatePage(page, finalFilteredTranslations, view, selectedLanguages);
           
           self.postMessage({
@@ -240,7 +237,6 @@ const workerCode = `
                   transLangs.forEach(lang => {
                       if (item[lang] !== undefined) {
                           newItem[lang] = item[lang];
-                          // Check if this is a non-English language with content
                           if (lang !== 'en-US') {
                               hasNonEnglishTranslation = true;
                           }
@@ -248,7 +244,6 @@ const workerCode = `
                   });
               }
               
-              // Only add to result if we found at least one non-English translation
               if (hasNonEnglishTranslation) {
                   acc.push(newItem);
               }
@@ -269,7 +264,8 @@ const workerCode = `
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
-      self.postMessage({ type: 'error', message: \`Error processing data: \${message}\`, jobId });
+      // Use concatenation to avoid nested template literal escaping issues
+      self.postMessage({ type: 'error', message: 'Error processing data: ' + message, jobId });
     }
   };
 `;
@@ -705,7 +701,7 @@ const App: React.FC = () => {
                 {/* Search Controls */}
                 <div className="space-y-4">
                     <div>
-                        <label htmlFor="key-search" className="block text-sm font-medium text-gray-300">Search by Key</label>
+                        <label htmlFor="key-search" className="block text-sm font-medium text-gray-300">Search by <span className="text-yellow-400 font-bold">Key</span></label>
                         <input
                             type="text"
                             id="key-search"
@@ -746,7 +742,7 @@ const App: React.FC = () => {
                     </div>
 
                     <div>
-                        <label htmlFor="source-search" className="block text-sm font-medium text-gray-300">Search in Source (en-US)</label>
+                        <label htmlFor="source-search" className="block text-sm font-medium text-gray-300">Search in <span className="text-yellow-400 font-bold">Source (en-US)</span></label>
                         <input
                             type="text"
                             id="source-search"
@@ -786,7 +782,7 @@ const App: React.FC = () => {
                         </div>
                     </div>
                     <div>
-                        <label htmlFor="target-search" className="block text-sm font-medium text-gray-300">Search in Target</label>
+                        <label htmlFor="target-search" className="block text-sm font-medium text-gray-300">Search in <span className="text-yellow-400 font-bold">Target</span></label>
                         <input
                             type="text"
                             id="target-search"
