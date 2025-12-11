@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ClipboardIcon from './components/icons/ClipboardIcon';
 import CheckIcon from './components/icons/CheckIcon';
@@ -11,6 +10,7 @@ const workerCode = `
   let primaryFilteredTranslations = []; // Result of sidebar filters
   let finalFilteredTranslations = []; // Result of primary + refine
   let currentRefineQuery = '';
+  let detectedKeys = []; // Stores keys found in the first item (excluding 'key')
 
   const PAGE_SIZE = 50;
 
@@ -69,7 +69,7 @@ const workerCode = `
           currentRefineQuery = '';
           
           // Extract languages from the first item
-          const languages = data.length > 0 
+          detectedKeys = data.length > 0 
             ? Object.keys(data[0]).filter(k => k !== 'key')
             : [];
 
@@ -77,7 +77,7 @@ const workerCode = `
             type: 'loaded', 
             total: allTranslations.length, 
             count: finalFilteredTranslations.length, 
-            languages,
+            languages: detectedKeys,
             jobId 
           });
           break;
@@ -149,20 +149,38 @@ const workerCode = `
                       // Target Logic
                       let targetMatch = true;
                       if (targetSearch !== '') {
-                          targetMatch = Object.entries(item).some(([key, value]) => {
-                              if (key === 'key' || key === 'en-US' || typeof value !== 'string') {
-                              return false;
-                              }
+                          // Default to false, try to find ANY match in target languages
+                          targetMatch = false;
+                          
+                          // Use detectedKeys to iterate only over known language columns
+                          // This avoids iterating over unexpected metadata fields or 'en-US' if we explicitly skip it
+                          for (let i = 0; i < detectedKeys.length; i++) {
+                              const langKey = detectedKeys[i];
                               
-                              const effectiveValue = matchTargetCase ? value : value.toLowerCase();
-                              if (matchTargetWholeWord) {
-                                  return effectiveValue === effectiveTargetSearch;
+                              // Strictly exclude 'en-US' from Target search
+                              if (langKey === 'en-US') continue;
+                              
+                              const val = item[langKey];
+                              // Ensure we are checking a string value and it exists
+                              if (val && typeof val === 'string') {
+                                  const effectiveValue = matchTargetCase ? val : val.toLowerCase();
+                                  
+                                  if (matchTargetWholeWord) {
+                                      if (effectiveValue === effectiveTargetSearch) {
+                                          targetMatch = true;
+                                          break;
+                                      }
+                                  } else {
+                                      if (effectiveValue.includes(effectiveTargetSearch)) {
+                                          targetMatch = true;
+                                          break;
+                                      }
+                                  }
                               }
-                              return effectiveValue.includes(effectiveTargetSearch);
-                          });
+                          }
                       }
 
-                      return sourceMatch && targetMatch;
+                      return targetMatch;
                   });
               }
           }
